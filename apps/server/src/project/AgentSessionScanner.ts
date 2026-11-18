@@ -7,6 +7,7 @@ import {
   AgentSessionScanError,
   ClaudeSettings,
   CodexSettings,
+  DEFAULT_SERVER_SETTINGS,
   ProviderDriverKind,
   ProviderInstanceId,
   resolveProviderInstanceEnabled,
@@ -14,6 +15,7 @@ import {
   type AgentSessionProjectGit,
   type AgentSessionScanResult,
   type ProviderInstanceConfig,
+  type SessionImportSettings,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -81,13 +83,27 @@ const MAX_METADATA_BYTES_PER_SOURCE = 64 * 1024 * 1024;
 const MAX_METADATA_OPERATIONS_PER_SOURCE = MAX_TRANSCRIPTS_PER_SOURCE * 4;
 const MAX_METADATA_RECORDS_PER_SOURCE = 100_000;
 const MAX_METADATA_RECORDS_PER_TRANSCRIPT = 1_000;
-const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
 // Screenshot-heavy transcripts can reach GiB; select fields while streaming to avoid allocating payloads.
 const MAX_IMPORTED_TRANSCRIPT_BYTES = 4 * 1024 * 1024 * 1024;
-const MAX_IMPORTED_MESSAGES = 200;
-const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
-const MAX_IMPORT_TRANSCRIPTS = 100;
+
+/** What an import considers and keeps; `settings.sessionImport` sets it (defaults: 30 days, 200, 32 MiB, 100). */
+interface ImportLimits {
+  readonly includeExcludedFolders: boolean;
+  readonly recentWindowMs: number;
+  readonly maxMessages: number;
+  readonly maxHistoryBytes: number;
+  readonly maxTranscripts: number;
+}
+const importLimits = (settings: SessionImportSettings): ImportLimits => ({
+  includeExcludedFolders: settings.includeExcludedFolders,
+  recentWindowMs: settings.recentWindowDays * DAY_MS,
+  maxMessages: settings.maxMessagesPerThread,
+  maxHistoryBytes: settings.maxHistoryMiB * 1024 * 1024,
+  maxTranscripts: settings.maxTranscriptsPerImport,
+});
+const DEFAULT_IMPORT_LIMITS = importLimits(DEFAULT_SERVER_SETTINGS.sessionImport);
 const MAX_IMPORT_RECORDS = 100_000;
 
 /**
@@ -510,6 +526,7 @@ function parseAgentSessionRecords(
   records: ReadonlyArray<DecodedTranscriptRecord>,
   claudeFields: ClaudeFields,
   droppedMessageCount: number,
+  maxMessages: number = DEFAULT_IMPORT_LIMITS.maxMessages,
 ): AgentSessionThread | "empty" | null {
   const fallbackTimestamp = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
   // Claude filenames are session IDs. Codex rollout filenames include extra
@@ -603,7 +620,7 @@ function parseAgentSessionRecords(
     hasAssistantMessage ||= message.role === "assistant";
     conversationMessageCount += 1;
     messages.push(message);
-    if (messages.length > MAX_IMPORTED_MESSAGES) messages.shift();
+    if (messages.length > maxMessages) messages.shift();
   };
 
   const hasMatchingCodexEventInTurn = (text: string) => {
@@ -728,7 +745,7 @@ function parseAgentSessionRecords(
   const { codexResponseUser: _codexResponseUser, ...visibleFirstUserMessage } = firstUserMessage;
   const retainedMessages = firstUserMessageRetained
     ? visibleMessages
-    : [visibleFirstUserMessage, ...visibleMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
+    : [visibleFirstUserMessage, ...visibleMessages.slice(-(maxMessages - 1))];
 
   return {
     source: input.source,
@@ -775,7 +792,7 @@ function shouldRetainDecodedRecord(
 
 // The import shows only the first user message and the latest messages, so a
 // long Claude session holds just those and counts the rest as dropped.
-function createClaudeHistoryWindow() {
+function createClaudeHistoryWindow(maxMessages: number) {
   const recent: Array<{ readonly record: DecodedTranscriptRecord; readonly bytes: number }> = [];
   let firstUser: DecodedTranscriptRecord | undefined;
   let droppedMessageCount = 0;
@@ -784,7 +801,7 @@ function createClaudeHistoryWindow() {
     push: (record: DecodedTranscriptRecord, bytes: number): number => {
       if (firstUser === undefined && record.type === "user") firstUser = record;
       recent.push({ record, bytes });
-      if (recent.length <= MAX_IMPORTED_MESSAGES) return 0;
+      if (recent.length <= maxMessages) return 0;
       const evicted = recent.shift();
       if (evicted === undefined || evicted.record === firstUser) return 0;
       droppedMessageCount += 1;
@@ -918,13 +935,22 @@ export const make = Effect.gen(function* () {
     path.join(homeDir, "Documents", "Codex"),
   ];
 
+  // Read from settings at the start of each scan and import (see refreshLimits).
+  let limits = DEFAULT_IMPORT_LIMITS;
+  const refreshLimits = (settings: { readonly sessionImport: SessionImportSettings }) => {
+    limits = importLimits(settings.sessionImport);
+  };
+
+  // Home, temp and the usual scratch folders are not projects unless the user opts in;
+  // T3's own state and worktrees never are.
   const isExcludedProjectPath = (candidatePath: string) =>
-    excludedProjectRoots.has(normalizeProjectPathForComparison(candidatePath)) ||
-    excludedProjectAncestors.some((ancestor) =>
-      normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
-        normalizeForWorktreeMatch(ancestor, foldWorktreeCase),
-      ),
-    ) ||
+    (!limits.includeExcludedFolders &&
+      (excludedProjectRoots.has(normalizeProjectPathForComparison(candidatePath)) ||
+        excludedProjectAncestors.some((ancestor) =>
+          normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
+            normalizeForWorktreeMatch(ancestor, foldWorktreeCase),
+          ),
+        ))) ||
     normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
       normalizeForWorktreeMatch(baseDir, foldWorktreeCase),
     ) ||
@@ -1290,7 +1316,7 @@ export const make = Effect.gen(function* () {
             }
             const readChunk = yield* transcriptChunkReader(file, filePath);
             const records: Array<DecodedTranscriptRecord> = [];
-            const claudeHistory = createClaudeHistoryWindow();
+            const claudeHistory = createClaudeHistoryWindow(limits.maxMessages);
             let cwd = Option.none<string>();
             let claudeFields = emptyClaudeFields;
             let historyBytes = prefix?.historyBytes ?? 0;
@@ -1298,9 +1324,9 @@ export const make = Effect.gen(function* () {
             let bytesRead = 0;
             const reserve = (bytes: number) => {
               recordBytes += bytes;
-              if (historyBytes + recordBytes > MAX_IMPORT_HISTORY_BYTES) {
+              if (historyBytes + recordBytes > limits.maxHistoryBytes) {
                 throw new TranscriptJsonLimitError({
-                  message: "Transcript selected history exceeds the 32 MiB memory budget",
+                  message: `Transcript selected history exceeds the ${limits.maxHistoryBytes / 1024 / 1024} MiB memory budget`,
                 });
               }
             };
@@ -1759,6 +1785,7 @@ export const make = Effect.gen(function* () {
     const settings = yield* serverSettings.getSettings.pipe(
       Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
     );
+    refreshLimits(settings);
 
     const runtimeRows = yield* runtimes
       .list()
@@ -2034,15 +2061,21 @@ export const make = Effect.gen(function* () {
     workspaceRoot: string,
     completedSources: ReadonlyArray<AgentSessionImportSource>,
   ) {
+    const settings = yield* serverSettings.getSettings.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
+    );
+    const includeExcludedChanged =
+      settings.sessionImport.includeExcludedFolders !== limits.includeExcludedFolders;
+    refreshLimits(settings);
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
     if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
     const rootIdentity = yield* directoryIdentity(root);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-    const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
+    const cutoffMs = nowMs - limits.recentWindowMs;
 
     // Imports recorded since a budget-truncated collection can free budget for transcripts it cut off.
-    if (cachedCandidates === null || cachedCandidates.metadataTruncated) {
+    if (cachedCandidates === null || cachedCandidates.metadataTruncated || includeExcludedChanged) {
       cachedCandidates = yield* collectCandidates();
     }
     const { candidates } = cachedCandidates;
@@ -2125,7 +2158,7 @@ export const make = Effect.gen(function* () {
     const importedSessions = new Set<string>();
     const codexThreadNamesByHome = new Map<string, ReadonlyMap<string, string>>();
     let bytesRemaining = MAX_IMPORT_BYTES;
-    let transcriptsRemaining = MAX_IMPORT_TRANSCRIPTS;
+    let transcriptsRemaining = limits.maxTranscripts;
     const codexRolloutPaths = new Map<ProviderInstanceId, ReadonlyMap<string, string>>();
     const codexRolloutPath = (providerInstanceId: ProviderInstanceId, rolloutId: string) => {
       let paths = codexRolloutPaths.get(providerInstanceId);
@@ -2255,6 +2288,7 @@ export const make = Effect.gen(function* () {
               : [...inheritedRecords, ...snapshot.records],
             snapshot.claudeFields,
             snapshot.droppedMessageCount,
+            limits.maxMessages,
           );
           if (parsedThread === "empty") {
             // null means an unreadable history base, which may hold the conversation.

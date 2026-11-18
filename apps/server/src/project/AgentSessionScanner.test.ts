@@ -67,6 +67,7 @@ interface ScannerTestInput {
     readonly sources: ReadonlyArray<AgentSessionImportSource>;
   };
   readonly processRunner?: Layer.Layer<ProcessRunner.ProcessRunner>;
+  readonly sessionImport?: Partial<ContractServerSettings["sessionImport"]> | undefined;
 }
 
 const layerRuntimeRepository = (imported: ScannerTestInput["importedTranscripts"]) =>
@@ -124,6 +125,7 @@ const layerScannerTest = (input: ScannerTestInput) =>
             },
             ...input.providerInstances,
           },
+          ...(input.sessionImport === undefined ? {} : { sessionImport: input.sessionImport }),
         }),
         ServerConfig.layerTest(
           input.claudeHomePath,
@@ -1015,6 +1017,56 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         const result = yield* runScan({ claudeHomePath, codexHomePath, configBaseDir });
 
         expect(result.candidates.map((candidate) => candidate.path)).toEqual([workspace]);
+      }),
+    );
+
+    it.effect("imports excluded folders and older sessions only when sessionImport allows", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-11-18T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const homeDir = yield* makeTempDir("t3code-home-");
+        const workspace = path.join(homeDir, "Downloads", "my-project");
+        yield* fileSystem.makeDirectory(workspace, { recursive: true });
+        const transcript = (sessionId: string, text: string) =>
+          `${JSON.stringify({ type: "user", cwd: workspace, sessionId, message: { role: "user", content: text } })}\n${JSON.stringify({ type: "assistant", sessionId, message: { role: "assistant", content: [{ type: "text", text: "Done" }] } })}\n`;
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-downloads", "recent.jsonl"),
+          contents: transcript("recent", "Recent work"),
+          mtimeMs: nowMs - 24 * 60 * 60 * 1000,
+        });
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-downloads", "older.jsonl"),
+          contents: transcript("older", "Older work"),
+          mtimeMs: nowMs - 45 * 24 * 60 * 60 * 1000,
+        });
+        const run = (sessionImport?: ScannerTestInput["sessionImport"]) =>
+          Effect.gen(function* () {
+            const scan = yield* runScan({ claudeHomePath, codexHomePath, sessionImport });
+            const threads = yield* runRecentThreads({
+              claudeHomePath,
+              codexHomePath,
+              sessionImport,
+              workspaceRoot: workspace,
+            });
+            return {
+              candidates: scan.candidates.map((candidate) => candidate.path),
+              titles: threads.map((thread) => thread.title).toSorted(),
+            };
+          }).pipe(Effect.provideService(HostProcess.HomeDirectory, homeDir));
+
+        expect(yield* run()).toEqual({ candidates: [], titles: [] });
+        expect(yield* run({ includeExcludedFolders: true })).toEqual({
+          candidates: [workspace],
+          titles: ["Recent work"],
+        });
+        expect(yield* run({ includeExcludedFolders: true, recentWindowDays: 60 })).toEqual({
+          candidates: [workspace],
+          titles: ["Older work", "Recent work"],
+        });
       }),
     );
 

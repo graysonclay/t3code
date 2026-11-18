@@ -1349,6 +1349,35 @@ export const StorageCleanupSettings = Schema.Struct({
 });
 export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 
+/**
+ * Which external Claude Code / Codex sessions an import considers, and how much of each it keeps.
+ * The defaults are the importer's built-in limits.
+ */
+const SessionImportWindowDays = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 36_500 }));
+const SessionImportMaxMessages = Schema.Int.check(
+  Schema.isBetween({ minimum: 2, maximum: 1_000_000 }),
+);
+const SessionImportMaxHistoryMiB = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: 4096 }),
+);
+const SessionImportMaxTranscripts = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: 5000 }),
+);
+
+export const SessionImportSettings = Schema.Struct({
+  /** Also import sessions started in home, temp, ~/Downloads or ~/Documents/Codex. */
+  includeExcludedFolders: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  recentWindowDays: SessionImportWindowDays.pipe(Schema.withDecodingDefault(Effect.succeed(30))),
+  maxMessagesPerThread: SessionImportMaxMessages.pipe(
+    Schema.withDecodingDefault(Effect.succeed(200)),
+  ),
+  maxHistoryMiB: SessionImportMaxHistoryMiB.pipe(Schema.withDecodingDefault(Effect.succeed(32))),
+  maxTranscriptsPerImport: SessionImportMaxTranscripts.pipe(
+    Schema.withDecodingDefault(Effect.succeed(100)),
+  ),
+});
+export type SessionImportSettings = typeof SessionImportSettings.Type;
+
 const UsageHistoryRetentionDays = Schema.Union([
   Schema.Int.check(Schema.isGreaterThan(0)),
   Schema.Literal("unlimited"),
@@ -1372,6 +1401,9 @@ export const ServerSettings = Schema.Struct({
   worktreeCleanup: WorktreeCleanup.pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   storageCleanup: StorageCleanupSettings.pipe(
     Schema.withDecodingDefault(Effect.succeed(Schema.decodeSync(StorageCleanupSettings)({}))),
+  ),
+  sessionImport: SessionImportSettings.pipe(
+    Schema.withDecodingDefault(Effect.succeed(Schema.decodeSync(SessionImportSettings)({}))),
   ),
 
   worktreesDirectory: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
@@ -1837,6 +1869,15 @@ export const ServerSettingsPatch = Schema.Struct({
         }),
       ]),
     ),
+  ),
+  sessionImport: Schema.optionalKey(
+    Schema.Struct({
+      includeExcludedFolders: Schema.optionalKey(Schema.Boolean),
+      recentWindowDays: Schema.optionalKey(SessionImportWindowDays),
+      maxMessagesPerThread: Schema.optionalKey(SessionImportMaxMessages),
+      maxHistoryMiB: Schema.optionalKey(SessionImportMaxHistoryMiB),
+      maxTranscriptsPerImport: Schema.optionalKey(SessionImportMaxTranscripts),
+    }),
   ),
   storageCleanup: Schema.optionalKey(
     Schema.Struct({
